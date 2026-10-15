@@ -1,0 +1,150 @@
+name: VHost Recon (bbot + ASN + ffuf)
+
+# يعمل يدويًا من تبويب Actions فقط
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: "الدومين المستهدف لتعداد الـ subdomains (مثال: example.com)"
+        required: true
+        type: string
+      asn_target:
+        description: "اسم المؤسسة أو رقم الـ ASN (مثال: Example Inc أو AS15169 أو 15169)"
+        required: true
+        type: string
+
+jobs:
+  vhost-recon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install bbot
+        run: pipx install bbot || pip install --user bbot
+
+      - name: Install ffuf and prips
+        run: |
+          go install -v github.com/ffuf/ffuf/v2@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -y
+          sudo apt-get install -y prips
+
+      # ---------- 1) تعداد الـ Subdomains باستخدام bbot ----------
+      - name: Subdomain enumeration (bbot)
+        run: |
+          bbot -t "${{ inputs.domain }}" -f subdomain-enum -y -o bbot_output --name recon_scan
+
+          # استخراج أسماء الـ subdomains من ملف المخرجات النصي
+          SCAN_TXT=$(find bbot_output/recon_scan -maxdepth 1 -name "output.txt" | head -n1)
+          if [ -f "$SCAN_TXT" ]; then
+            grep -E "^DNS_NAME" "$SCAN_TXT" | awk '{print $2}' | sort -u > subs.txt
+          fi
+
+          # نضمن أن الدومين الأساسي موجود كحد أدنى
+          echo "${{ inputs.domain }}" >> subs.txt
+          sort -u -o subs.txt subs.txt
+
+          echo "تم جمع $(wc -l < subs.txt) نطاق فرعي عبر bbot"
+
+      # ---------- 2) تخطيط الـ ASN عبر bgp.he.net ----------
+      - name: ASN mapping (bgp.he.net)
+        run: |
+          TARGET="${{ inputs.asn_target }}"
+          : > asns.txt
+
+          if echo "$TARGET" | grep -qiE '^(AS)?[0-9]+$'; then
+            # المدخل رقم ASN مباشرة
+            echo "$TARGET" | grep -oiE '[0-9]+' >> asns.txt
+          else
+            # المدخل اسم مؤسسة: نبحث في bgp.he.net ونستخرج كل أرقام الـ ASN المطابقة
+            curl -s -A "Mozilla/5.0" \
+              "https://bgp.he.net/search?search%5Bsearch%5D=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$TARGET")&commit=Search" \
+              | grep -oE 'AS[0-9]+' | grep -oE '[0-9]+' | sort -u >> asns.txt
+          fi
+
+          sort -u -o asns.txt asns.txt
+          echo "ASNs المكتشفة:"
+          cat asns.txt
+
+          : > ranges.txt
+          while read -r asn; do
+            [ -z "$asn" ] && continue
+            echo "== جلب الـ prefixes لـ AS${asn} =="
+            curl -s -A "Mozilla/5.0" "https://bgp.he.net/AS${asn}" \
+              | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' >> ranges.txt
+            sleep 2
+          done < asns.txt
+
+          sort -u -o ranges.txt ranges.txt
+          echo "تم جمع $(wc -l < ranges.txt) نطاق CIDR"
+          cat ranges.txt
+
+      - name: Expand CIDR ranges to IPs (prips)
+        run: |
+          : > ips.txt
+          while read -r cidr; do
+            [ -z "$cidr" ] && continue
+            prips "$cidr" >> ips.txt 2>/dev/null || true
+          done < ranges.txt
+          sort -u -o ips.txt ips.txt
+          echo "تم توليد $(wc -l < ips.txt) عنوان IP من نطاقات الـ ASN"
+
+      # ---------- 3) اكتشاف الـ Vhosts عبر ffuf ----------
+      - name: VHost fuzzing via Host header (ffuf)
+        run: |
+          mkdir -p results
+          : > results/vhosts_found.txt
+
+          while read -r ip; do
+            [ -z "$ip" ] && continue
+            echo "== Fuzzing Host header on $ip =="
+
+            ffuf -u "https://${ip}/" \
+                 -H "Host: FUZZ" \
+                 -w subs.txt \
+                 -t 50 \
+                 -timeout 5 \
+                 -mc all \
+                 -fc 404 \
+                 -of csv \
+                 -o "results/${ip//./_}.csv" \
+                 -s || true
+
+            if [ -f "results/${ip//./_}.csv" ]; then
+              tail -n +2 "results/${ip//./_}.csv" | awk -F',' -v ip="$ip" '{print ip","$0}' >> results/vhosts_found.txt
+            fi
+          done < ips.txt
+
+          cp subs.txt asns.txt ranges.txt ips.txt results/
+
+      - name: Print summary
+        run: |
+          {
+            echo "### نتائج Vhost Discovery"
+            echo "- عدد الـ subdomains: $(wc -l < subs.txt)"
+            echo "- عدد الـ ASNs: $(wc -l < asns.txt)"
+            echo "- عدد نطاقات CIDR: $(wc -l < ranges.txt)"
+            echo "- عدد عناوين الـ IP المفحوصة: $(wc -l < ips.txt)"
+            echo '```'
+            if [ -s results/vhosts_found.txt ]; then
+              cat results/vhosts_found.txt
+            else
+              echo "لم يتم العثور على نتائج."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vhost-recon-${{ inputs.domain }}
+          path: results/
+          retention-days: 14
